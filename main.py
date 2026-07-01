@@ -100,6 +100,40 @@ def main_menu():
 # ─── /start ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Проверяем QR-токен в аргументах /start
+    args = ctx.args
+    if args and len(args) == 1 and args[0].startswith("qr_"):
+        token = args[0]
+        tg_id = update.effective_user.id
+        user = update.effective_user
+        
+        # Записываем telegram_id к токену
+        try:
+            result = db.from_("auth_tokens").select("*").eq("token", token).eq("used", False).execute()
+            if result.data:
+                db.from_("auth_tokens").update({
+                    "telegram_id": tg_id,
+                    "used": True
+                }).eq("token", token).execute()
+                
+                await update.message.reply_text(
+                    f"✅ Авторизация успешна!\n\n"
+                    f"Вернись на сайт — он автоматически войдёт в систему.\n\n"
+                    f"Или работай прямо здесь — напиши /start",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+                # Теперь обычный старт
+                return await handle_start_logic(update, ctx)
+            else:
+                await update.message.reply_text("❌ Ссылка недействительна или устарела.")
+        except Exception as e:
+            logger.error(f"QR auth error: {e}")
+            await update.message.reply_text("❌ Ошибка авторизации.")
+        return
+
+    return await handle_start_logic(update, ctx)
+
+async def handle_start_logic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     # 1. Проверяем менеджеров/админов
     manager = await get_manager(tg_id)
