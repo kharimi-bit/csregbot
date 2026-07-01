@@ -85,7 +85,7 @@ def main_menu():
     return ReplyKeyboardMarkup([
         ["📋 Мои заявки", "👥 Состав команды"],
         ["➕ Добавить игрока", "📤 Отправить заявку"],
-        ["📊 Статус заявки"]
+        ["📊 Статус заявки", "🔄 Сбросить сессию"]
     ], resize_keyboard=True)
 
 # ─── /start ──────────────────────────────────────────────────────────────────
@@ -867,6 +867,19 @@ async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(query.message.text + "\n\n❌ Заявка отклонена")
 
 
+async def reset_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сбросить сессию — удалить из pending_hr и начать заново."""
+    tg_id = update.effective_user.id
+    
+    # Удалить из pending если есть
+    db.from_("pending_hr").delete().eq("telegram_id", tg_id).execute()
+    ctx.user_data.clear()
+    
+    await update.message.reply_text(
+        "🔄 Сессия сброшена. Напиши /start чтобы начать заново.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
 def main():
     app = Application.builder().token(TG_TOKEN).build()
 
@@ -903,11 +916,13 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^👥 Состав команды$"), show_roster))
     app.add_handler(MessageHandler(filters.Regex("^📤 Отправить заявку$"), submit_registration))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статус заявки$"), check_status))
+    app.add_handler(MessageHandler(filters.Regex("^🔄 Сбросить сессию$"), reset_session))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(approve_hr|reject_hr|approve_reg|reject_reg|newco_hr|make_manager):"))
     app.add_handler(CallbackQueryHandler(manager_tour_callback, pattern="^mgr_tour:"))
     app.add_handler(MessageHandler(filters.Regex("^🏆 Все турниры$"), manager_all_tournaments))
     app.add_handler(MessageHandler(filters.Regex("^📋 Все заявки$"), manager_all_registrations))
 
+    app.add_handler(CommandHandler("reset", reset_session))
     logger.info("CoReg bot started")
     app.run_polling(drop_pending_updates=True)
 
