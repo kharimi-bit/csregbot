@@ -571,6 +571,93 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отменено.", reply_markup=main_menu())
     return ConversationHandler.END
 
+# ─── ЗАГРУЗКА ФАЙЛА / ФОТО ───────────────────────────────────────────────────
+
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Принять фото или файл, распознать текст через Claude Vision."""
+    tg_id = update.effective_user.id
+    hr = await get_hr(tg_id)
+    if not hr:
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+
+    msg = await update.message.reply_text("🔍 Читаю документ...")
+
+    try:
+        # Получить файл
+        if update.message.photo:
+            file = await update.message.photo[-1].get_file()
+            file_ext = "jpg"
+            media_type = "image/jpeg"
+        elif update.message.document:
+            file = await update.message.document.get_file()
+            fname = update.message.document.file_name or ""
+            file_ext = fname.split(".")[-1].lower() if "." in fname else "pdf"
+            media_type = "image/jpeg" if file_ext in ("jpg","jpeg","png") else "application/pdf"
+        else:
+            await msg.edit_text("❌ Неподдерживаемый тип файла.")
+            return
+
+        # Скачать байты
+        import io
+        file_bytes = await file.download_as_bytearray()
+        import base64
+        b64 = base64.b64encode(file_bytes).decode()
+
+        # Отправить в Claude Vision
+        import httpx
+        payload = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1000,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "Прочитай текст на этом документе/фото и выведи его. Если это медицинская справка или согласие — выдели ключевые данные: ФИО, дата, организация. Отвечай на русском."
+                    }
+                ]
+            }]
+        }
+
+        import os
+        claude_key = os.environ.get("CLAUDE_KEY", "")
+        if not claude_key:
+            await msg.edit_text("⚠️ Claude API ключ не настроен. Файл принят, но распознавание недоступно.")
+            return
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": claude_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json=payload
+            )
+            result = resp.json()
+
+        text = result.get("content", [{}])[0].get("text", "Не удалось прочитать")
+
+        # Сохранить URL файла (если нужно) — пока просто показываем текст
+        await msg.edit_text(
+            f"📄 *Результат распознавания:*\n\n{text[:3000]}",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"Document processing error: {e}")
+        await msg.edit_text(f"❌ Ошибка обработки файла: {str(e)[:200]}")
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 # ─── МЕНЕДЖЕР: ВСЕ ТУРНИРЫ ──────────────────────────────────────────────────
@@ -917,6 +1004,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📤 Отправить заявку$"), submit_registration))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статус заявки$"), check_status))
     app.add_handler(MessageHandler(filters.Regex("^🔄 Сбросить сессию$"), reset_session))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(approve_hr|reject_hr|approve_reg|reject_reg|newco_hr|make_manager):"))
     app.add_handler(CallbackQueryHandler(manager_tour_callback, pattern="^mgr_tour:"))
     app.add_handler(MessageHandler(filters.Regex("^🏆 Все турниры$"), manager_all_tournaments))
