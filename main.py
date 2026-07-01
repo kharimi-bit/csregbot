@@ -619,7 +619,25 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 try:
                     from docx import Document
                     doc = Document(io.BytesIO(bytes(file_bytes)))
-                    extracted_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                    raw_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                    # Отправим текст в Claude для структурирования
+                    payload_text = {
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 1000,
+                        "messages": [{"role": "user", "content": f"""Это заявка команды. Извлеки список игроков и верни ТОЛЬКО JSON без пояснений:
+{{"captain": {{"name": "ФИО", "phone": "телефон", "position": "должность"}}, "vice_captain": {{"name": "ФИО", "phone": "телефон", "position": "должность"}}, "players": [{{"name": "ФИО", "phone": "телефон", "position": "должность"}}]}}
+Если поле не найдено — пустая строка. Только JSON.
+
+Текст документа:
+{raw_text[:3000]}"""}]
+                    }
+                    async with httpx.AsyncClient(timeout=30) as client2:
+                        r2 = await client2.post(
+                            "https://api.anthropic.com/v1/messages",
+                            headers={"x-api-key": claude_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                            json=payload_text
+                        )
+                        extracted_text = r2.json().get("content", [{}])[0].get("text", raw_text)
                 except Exception as e:
                     extracted_text = f"Не удалось прочитать DOCX: {e}"
 
@@ -693,7 +711,9 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "role": "user",
                     "content": [
                         {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                        {"type": "text", "text": "Прочитай весь текст на этом документе/фото. Если это медсправка, согласие или заявка — выдели: ФИО, дата, организация, подпись. Отвечай на русском."}
+                        {"type": "text", "text": """Это заявка команды на соревнование. Извлеки список игроков и верни ТОЛЬКО JSON без пояснений:
+{"captain": {"name": "ФИО", "phone": "телефон", "position": "должность"}, "vice_captain": {"name": "ФИО", "phone": "телефон", "position": "должность"}, "players": [{"name": "ФИО", "phone": "телефон", "position": "должность"}, ...]}
+Если поле не найдено — пустая строка. Только JSON, без текста вокруг."""}
                     ]
                 }]
             }
@@ -706,11 +726,60 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 result = resp.json()
             extracted_text = result.get("content", [{}])[0].get("text", "Не удалось прочитать")
 
-        # Убираем спецсимволы Markdown чтобы не ломало Telegram
-        safe_text = (extracted_text or "Пусто")[:3000]
-        for ch in ['*', '_', '`', '[', ']']:
-            safe_text = safe_text.replace(ch, '')
-        await msg.edit_text(f"📄 Результат:\n\n{safe_text}")
+        # Попробуем распарсить JSON с игроками
+        import json, re
+        parsed = None
+        try:
+            json_match = re.search(r'\{.*\}', extracted_text or '', re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+        except Exception:
+            parsed = None
+
+        if parsed:
+            # Форматируем красиво
+            lines = ["📋 Распознанные данные заявки:\n"]
+            all_players = []
+
+            cap = parsed.get("captain", {})
+            if cap.get("name"):
+                lines.append(f"👑 Капитан: {cap['name']}")
+                if cap.get("position"): lines.append(f"   Должность: {cap['position']}")
+                if cap.get("phone"): lines.append(f"   Телефон: {cap['phone']}")
+                all_players.append({"name": cap["name"], "phone": cap.get("phone",""), "position": cap.get("position",""), "is_captain": True})
+
+            vice = parsed.get("vice_captain", {})
+            if vice.get("name"):
+                lines.append(f"\n🥈 Вице-капитан: {vice['name']}")
+                if vice.get("position"): lines.append(f"   Должность: {vice['position']}")
+                if vice.get("phone"): lines.append(f"   Телефон: {vice['phone']}")
+                all_players.append({"name": vice["name"], "phone": vice.get("phone",""), "position": vice.get("position",""), "is_captain": False})
+
+            for i, p in enumerate(parsed.get("players", []), 1):
+                if p.get("name") and p["name"] not in [x["name"] for x in all_players]:
+                    lines.append(f"\n{i}. {p['name']}")
+                    if p.get("position"): lines.append(f"   Должность: {p['position']}")
+                    if p.get("phone"): lines.append(f"   Телефон: {p['phone']}")
+                    all_players.append({"name": p["name"], "phone": p.get("phone",""), "position": p.get("position",""), "is_captain": False})
+
+            lines.append(f"\n\nВсего игроков: {len(all_players)}")
+            lines.append("\nВсё верно? Добавить всех в заявку?")
+
+            # Сохраняем в ctx для подтверждения
+            ctx.user_data["pending_players"] = all_players
+
+            import json as json2
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, добавить всех", callback_data="confirm_bulk_add"),
+                InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_add")
+            ]])
+            await msg.edit_text("\n".join(lines), reply_markup=kb)
+        else:
+            # Не удалось распарсить — показываем как текст
+            safe_text = (extracted_text or "Пусто")[:2000]
+            for ch in ['*', '_', '`', '[', ']', '#']:
+                safe_text = safe_text.replace(ch, '')
+            await msg.edit_text(f"📄 Результат:\n\n{safe_text}")
 
     except Exception as e:
         logger.error(f"Document processing error: {e}")
@@ -1012,6 +1081,102 @@ async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(query.message.text + "\n\n❌ Заявка отклонена")
 
 
+async def bulk_add_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение массового добавления игроков из документа."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel_bulk_add":
+        await query.edit_message_text("❌ Отменено. Данные не добавлены.")
+        return
+
+    if query.data != "confirm_bulk_add":
+        return
+
+    tg_id = update.effective_user.id
+    hr = await get_hr(tg_id)
+    if not hr:
+        await query.edit_message_text("❌ Нет доступа.")
+        return
+
+    players_to_add = ctx.user_data.get("pending_players", [])
+    if not players_to_add:
+        await query.edit_message_text("❌ Нет данных для добавления.")
+        return
+
+    company_id = hr["companies"]["id"]
+
+    # Найти активную черновую заявку
+    regs = db.from_("team_registrations").select("*,tournaments(roster_schema)")         .eq("company_id", company_id).eq("status", "draft").execute()
+    if not regs.data:
+        await query.edit_message_text("❌ Нет активной заявки в черновике. Сначала выбери турнир.")
+        return
+
+    reg = regs.data[0]
+    reg_id = reg["id"]
+
+    # Текущий максимальный order_no
+    existing = db.from_("tournament_roster").select("order_no,player_id")         .eq("registration_id", reg_id).order("order_no", desc=True).execute()
+    next_no = (existing.data[0]["order_no"] if existing.data else 0) + 1
+    existing_player_ids = {r["player_id"] for r in (existing.data or [])}
+
+    added = []
+    skipped = []
+
+    for p in players_to_add:
+        if not p.get("name"):
+            continue
+        # Проверить есть ли уже в пуле
+        pool_check = db.from_("players_pool").select("id")             .eq("company_id", company_id).eq("full_name", p["name"]).execute()
+
+        if pool_check.data:
+            player_id = pool_check.data[0]["id"]
+            # Обновить телефон/должность если есть
+            if p.get("phone") or p.get("position"):
+                db.from_("players_pool").update({
+                    "phone": p.get("phone") or None,
+                    "notes": p.get("position") or None
+                }).eq("id", player_id).execute()
+        else:
+            # Создать нового
+            new_p = db.from_("players_pool").insert({
+                "company_id": company_id,
+                "full_name": p["name"],
+                "phone": p.get("phone") or None,
+                "notes": p.get("position") or None
+            }).execute()
+            player_id = new_p.data[0]["id"]
+
+        # Добавить в состав если ещё нет
+        if player_id not in existing_player_ids:
+            is_captain = p.get("is_captain", False)
+            order = 1 if is_captain else next_no
+            if is_captain:
+                # Сбросить текущего капитана
+                db.from_("tournament_roster").update({"order_no": 99})                     .eq("registration_id", reg_id).eq("order_no", 1).execute()
+
+            db.from_("tournament_roster").insert({
+                "registration_id": reg_id,
+                "player_id": player_id,
+                "order_no": order,
+                "is_reserve": False
+            }).execute()
+            if not is_captain:
+                next_no += 1
+            added.append(p["name"])
+            existing_player_ids.add(player_id)
+        else:
+            skipped.append(p["name"])
+
+    result = f"✅ Добавлено игроков: {len(added)}\n"
+    if added:
+        result += "\n".join(f"  • {n}" for n in added)
+    if skipped:
+        result += f"\n\n⏭ Уже были в заявке: {len(skipped)}"
+
+    ctx.user_data.pop("pending_players", None)
+    await query.edit_message_text(result, reply_markup=None)
+
 async def reset_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Сбросить сессию — удалить из pending_hr и начать заново."""
     tg_id = update.effective_user.id
@@ -1062,6 +1227,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📤 Отправить заявку$"), submit_registration))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статус заявки$"), check_status))
     app.add_handler(MessageHandler(filters.Regex("^🔄 Сбросить сессию$"), reset_session))
+    app.add_handler(CallbackQueryHandler(bulk_add_callback, pattern="^(confirm_bulk_add|cancel_bulk_add)$"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_document))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(approve_hr|reject_hr|approve_reg|reject_reg|newco_hr|make_manager):"))
