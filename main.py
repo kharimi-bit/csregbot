@@ -85,13 +85,15 @@ def manager_menu():
     return ReplyKeyboardMarkup([
         ["🏆 Все турниры", "📋 Все заявки"],
         ["🔍 Найти команду", "👥 Игроки компании"],
+        ["🌐 Открыть панель"]
     ], resize_keyboard=True)
 
 def main_menu():
     return ReplyKeyboardMarkup([
         ["📋 Мои заявки", "👥 Состав команды"],
         ["➕ Добавить игрока", "📤 Отправить заявку"],
-        ["📊 Статус заявки", "🔄 Сбросить сессию"]
+        ["📊 Статус заявки", "🔄 Сбросить сессию"],
+        ["🌐 Открыть панель"]
     ], resize_keyboard=True)
 
 # ─── /start ──────────────────────────────────────────────────────────────────
@@ -575,6 +577,20 @@ async def check_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
 
 # ─── CANCEL ──────────────────────────────────────────────────────────────────
+
+async def open_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Открыть мини-апп."""
+    from telegram import WebAppInfo
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🌐 Открыть панель CoReg",
+            web_app=WebAppInfo(url="https://cosportsreg.vercel.app")
+        )
+    ]])
+    await update.message.reply_text(
+        "Открой полную панель регистрации прямо в Telegram:",
+        reply_markup=kb
+    )
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отменено.", reply_markup=main_menu())
@@ -1246,6 +1262,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📋 Все заявки$"), manager_all_registrations))
 
     app.add_handler(CommandHandler("reset", reset_session))
+    app.add_handler(CommandHandler("app", open_app))
+    app.add_handler(MessageHandler(filters.Regex("^🌐 Открыть панель$"), open_app))
     logger.info("CoReg bot started")
     app.run_polling(drop_pending_updates=True)
 
