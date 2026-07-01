@@ -23,7 +23,8 @@ db = create_client(SB_URL, SB_KEY)
 WEB_URL = "https://cosportsreg.vercel.app"
 PLATFORM_TIP = (
     "\n\n💡 Работай где удобно:\n"
-    f"• Telegram-бот — прямо здесь\n"
+    "• Telegram-бот — прямо здесь\n"
+    f"• Мини-апп — t.me/cosports_reg_bot/csreg\n"
     f"• Веб-панель — {WEB_URL}"
 )
 
@@ -588,7 +589,8 @@ async def open_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     ]])
     await update.message.reply_text(
-        "Открой полную панель регистрации прямо в Telegram:",
+        "🌐 Открой панель регистрации прямо в Telegram:\n"
+        "Или перейди по ссылке: t.me/cosports_reg_bot/csreg",
         reply_markup=kb
     )
 
