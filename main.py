@@ -584,79 +584,85 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔍 Читаю документ...")
 
     try:
-        # Получить файл
+        import io, base64, os
+        import httpx
+
+        claude_key = os.environ.get("CLAUDE_KEY", "")
+        if not claude_key:
+            await msg.edit_text("⚠️ Claude API ключ не настроен.")
+            return
+
+        extracted_text = None
+        is_image = False
+
         if update.message.photo:
+            # Фото → Vision
             file = await update.message.photo[-1].get_file()
-            file_ext = "jpg"
+            file_bytes = await file.download_as_bytearray()
+            b64 = base64.b64encode(file_bytes).decode()
+            is_image = True
             media_type = "image/jpeg"
+
         elif update.message.document:
             file = await update.message.document.get_file()
-            fname = update.message.document.file_name or ""
-            file_ext = fname.split(".")[-1].lower() if "." in fname else "pdf"
-            media_type = "image/jpeg" if file_ext in ("jpg","jpeg","png") else "application/pdf"
+            fname = (update.message.document.file_name or "").lower()
+            file_bytes = await file.download_as_bytearray()
+
+            if fname.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                # Изображение → Vision
+                b64 = base64.b64encode(file_bytes).decode()
+                is_image = True
+                media_type = "image/jpeg" if not fname.endswith(".png") else "image/png"
+
+            elif fname.endswith(".docx"):
+                # DOCX → извлечь текст
+                try:
+                    from docx import Document
+                    doc = Document(io.BytesIO(bytes(file_bytes)))
+                    extracted_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                except Exception as e:
+                    extracted_text = f"Не удалось прочитать DOCX: {e}"
+
+            elif fname.endswith(".pdf"):
+                extracted_text = "PDF-файлы пока не поддерживаются. Пожалуйста, отправь фото документа."
+
+            else:
+                await msg.edit_text("❌ Поддерживаются: фото (jpg/png), Word (.docx).")
+                return
         else:
             await msg.edit_text("❌ Неподдерживаемый тип файла.")
             return
 
-        # Скачать байты
-        import io
-        file_bytes = await file.download_as_bytearray()
-        import base64
-        b64 = base64.b64encode(file_bytes).decode()
+        if is_image:
+            # Отправить изображение в Claude Vision
+            payload = {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1000,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                        {"type": "text", "text": "Прочитай весь текст на этом документе/фото. Если это медсправка, согласие или заявка — выдели: ФИО, дата, организация, подпись. Отвечай на русском."}
+                    ]
+                }]
+            }
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": claude_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json=payload
+                )
+                result = resp.json()
+            extracted_text = result.get("content", [{}])[0].get("text", "Не удалось прочитать")
 
-        # Отправить в Claude Vision
-        import httpx
-        payload = {
-            "model": "claude-sonnet-4-6",
-            "max_tokens": 1000,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": b64
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": "Прочитай текст на этом документе/фото и выведи его. Если это медицинская справка или согласие — выдели ключевые данные: ФИО, дата, организация. Отвечай на русском."
-                    }
-                ]
-            }]
-        }
-
-        import os
-        claude_key = os.environ.get("CLAUDE_KEY", "")
-        if not claude_key:
-            await msg.edit_text("⚠️ Claude API ключ не настроен. Файл принят, но распознавание недоступно.")
-            return
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": claude_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                json=payload
-            )
-            result = resp.json()
-
-        text = result.get("content", [{}])[0].get("text", "Не удалось прочитать")
-
-        # Сохранить URL файла (если нужно) — пока просто показываем текст
         await msg.edit_text(
-            f"📄 *Результат распознавания:*\n\n{text[:3000]}",
+            f"📄 *Результат:*\n\n{extracted_text[:3000]}",
             parse_mode="Markdown"
         )
 
     except Exception as e:
         logger.error(f"Document processing error: {e}")
-        await msg.edit_text(f"❌ Ошибка обработки файла: {str(e)[:200]}")
+        await msg.edit_text(f"❌ Ошибка: {str(e)[:300]}")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
