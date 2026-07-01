@@ -29,14 +29,20 @@ db = create_client(SB_URL, SB_KEY)
 
 async def get_hr(telegram_id: int):
     """Вернуть company_user + company если HR авторизован."""
-    r = db.from_("company_users").select("*,companies(id,name)") \
-        .eq("telegram_id", telegram_id).single().execute()
-    return r.data if r.data else None
+    try:
+        r = db.from_("company_users").select("*,companies(id,name)") \
+            .eq("telegram_id", telegram_id).execute()
+        return r.data[0] if r.data else None
+    except Exception:
+        return None
 
 async def get_registration(company_id: str, tournament_id: str):
-    r = db.from_("team_registrations").select("*") \
-        .eq("company_id", company_id).eq("tournament_id", tournament_id).single().execute()
-    return r.data
+    try:
+        r = db.from_("team_registrations").select("*") \
+            .eq("company_id", company_id).eq("tournament_id", tournament_id).execute()
+        return r.data[0] if r.data else None
+    except Exception:
+        return None
 
 async def ensure_registration(company_id: str, tournament_id: str):
     reg = await get_registration(company_id, tournament_id)
@@ -83,7 +89,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # Проверить pending
-    p = db.from_("pending_hr").select("*").eq("telegram_id", tg_id).single().execute()
+    p = db.from_("pending_hr").select("*").eq("telegram_id", tg_id).execute()
+    if p.data:
+        p.data = p.data[0]
     if p.data:
         status = p.data["status"]
         if status == "pending":
@@ -306,7 +314,8 @@ async def pool_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AWAIT_PLAYER_NAME
 
     player_id = query.data.replace("pool_", "")
-    player = db.from_("players_pool").select("*").eq("id", player_id).single().execute().data
+    pr = db.from_("players_pool").select("*").eq("id", player_id).execute()
+    player = pr.data[0] if pr.data else {}
 
     # Добавить в состав
     roster = db.from_("tournament_roster").select("order_no") \
