@@ -624,10 +624,61 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     extracted_text = f"Не удалось прочитать DOCX: {e}"
 
             elif fname.endswith(".pdf"):
-                extracted_text = "PDF-файлы пока не поддерживаются. Пожалуйста, отправь фото документа."
+                # PDF → конвертировать страницы в изображения и читать через Vision
+                try:
+                    import fitz  # pymupdf
+                    doc_pdf = fitz.open(stream=bytes(file_bytes), filetype="pdf")
+                    pages_text = []
+                    for page_num in range(min(3, len(doc_pdf))):  # макс 3 страницы
+                        page = doc_pdf[page_num]
+                        # Сначала попробуем извлечь текст напрямую
+                        page_text = page.get_text().strip()
+                        if page_text:
+                            pages_text.append(page_text)
+                        else:
+                            # Если текст не извлечь - рендерим как изображение
+                            mat = fitz.Matrix(2, 2)
+                            pix = page.get_pixmap(matrix=mat)
+                            img_bytes = pix.tobytes("jpeg")
+                            b64_page = base64.b64encode(img_bytes).decode()
+                            payload_page = {
+                                "model": "claude-sonnet-4-6",
+                                "max_tokens": 800,
+                                "messages": [{"role": "user", "content": [
+                                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_page}},
+                                    {"type": "text", "text": "Прочитай весь текст на этой странице PDF. Отвечай на русском."}
+                                ]}]
+                            }
+                            async with httpx.AsyncClient(timeout=30) as client:
+                                r = await client.post(
+                                    "https://api.anthropic.com/v1/messages",
+                                    headers={"x-api-key": claude_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                                    json=payload_page
+                                )
+                                pages_text.append(r.json().get("content", [{}])[0].get("text", ""))
+                    extracted_text = "\n\n--- Стр. ---\n\n".join(pages_text) if pages_text else "Текст не найден"
+                except Exception as e:
+                    extracted_text = f"Ошибка чтения PDF: {e}"
+
+            elif fname.endswith((".xlsx", ".xls")):
+                # Excel → извлечь данные
+                try:
+                    import openpyxl
+                    wb = openpyxl.load_workbook(io.BytesIO(bytes(file_bytes)), data_only=True)
+                    rows_text = []
+                    for sheet in wb.sheetnames[:2]:  # макс 2 листа
+                        ws = wb[sheet]
+                        rows_text.append(f"📊 Лист: {sheet}")
+                        for row in ws.iter_rows(max_row=50, values_only=True):
+                            cells = [str(c) for c in row if c is not None]
+                            if cells:
+                                rows_text.append(" | ".join(cells))
+                    extracted_text = "\n".join(rows_text) if rows_text else "Файл пуст"
+                except Exception as e:
+                    extracted_text = f"Ошибка чтения Excel: {e}"
 
             else:
-                await msg.edit_text("❌ Поддерживаются: фото (jpg/png), Word (.docx).")
+                await msg.edit_text("❌ Поддерживаются: фото (jpg/png), Word (.docx), PDF, Excel (.xlsx).")
                 return
         else:
             await msg.edit_text("❌ Неподдерживаемый тип файла.")
@@ -655,10 +706,11 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 result = resp.json()
             extracted_text = result.get("content", [{}])[0].get("text", "Не удалось прочитать")
 
-        await msg.edit_text(
-            f"📄 *Результат:*\n\n{extracted_text[:3000]}",
-            parse_mode="Markdown"
-        )
+        # Убираем спецсимволы Markdown чтобы не ломало Telegram
+        safe_text = (extracted_text or "Пусто")[:3000]
+        for ch in ['*', '_', '`', '[', ']']:
+            safe_text = safe_text.replace(ch, '')
+        await msg.edit_text(f"📄 Результат:\n\n{safe_text}")
 
     except Exception as e:
         logger.error(f"Document processing error: {e}")
