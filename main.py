@@ -169,23 +169,35 @@ async def receive_company(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Получить список компаний для кнопок
     companies_r = db.from_("companies").select("id,name").order("name").execute()
     companies_list = companies_r.data or []
-    
+
     kb = []
-    for c in companies_list[:10]:  # макс 10 кнопок
+    for c in companies_list[:10]:
         cname = c["name"][:20]
         kb.append([InlineKeyboardButton(
             f"✅ {cname}",
             callback_data=f"approve_hr:{tg_id}:{c['id']}"
         )])
+    # Кнопка новой компании с именем что написал HR
+    import urllib.parse
+    safe_name = company_name[:30].replace(":", "-")
+    kb.append([InlineKeyboardButton(
+        f"➕ Новая: {safe_name[:20]}",
+        callback_data=f"newco_hr:{tg_id}:{safe_name}"
+    )])
+    # Назначить менеджером
+    kb.append([InlineKeyboardButton(
+        "🛠 Назначить менеджером",
+        callback_data=f"make_manager:{tg_id}"
+    )])
     kb.append([InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_hr:{tg_id}")])
 
     await send_admin(
         ctx.application,
-        f"🆕 Новая заявка на доступ HR!\n"
+        f"🆕 Новая заявка на доступ!\n"
         f"👤 {user.full_name} (@{user.username or '—'})\n"
         f"🏢 Написал: {company_name}\n"
         f"🆔 Telegram ID: {tg_id}\n\n"
-        f"Выбери компанию для подтверждения:",
+        f"Выбери действие:",
         reply_markup=InlineKeyboardMarkup(kb)
     )
     return ConversationHandler.END
@@ -693,6 +705,91 @@ async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Cannot notify HR {tg_id}: {e}")
 
+    # ── НОВАЯ КОМПАНИЯ + ПОДТВЕРДИТЬ HR ─────────────────────────────────────
+    elif data.startswith("newco_hr:"):
+        parts = data.split(":", 2)
+        tg_id = int(parts[1])
+        new_company_name = parts[2] if len(parts) > 2 else "Новая компания"
+
+        # Создать компанию
+        existing = db.from_("companies").select("id").eq("name", new_company_name).execute()
+        if existing.data:
+            company_id = existing.data[0]["id"]
+        else:
+            new_comp = db.from_("companies").insert({"name": new_company_name}).execute()
+            company_id = new_comp.data[0]["id"]
+
+        # Обновить pending_hr
+        db.from_("pending_hr").update({
+            "status": "approved",
+            "company_id": company_id
+        }).eq("telegram_id", tg_id).execute()
+
+        # Создать company_user
+        pending = db.from_("pending_hr").select("username,full_name").eq("telegram_id", tg_id).execute()
+        p = pending.data[0] if pending.data else {}
+        login = (p.get("username") or f"hr_{tg_id}").lower().replace(" ", "_")[:20]
+        existing_cu = db.from_("company_users").select("id").eq("telegram_id", tg_id).execute()
+        if not existing_cu.data:
+            db.from_("company_users").insert({
+                "company_id": company_id,
+                "login": login,
+                "password_hash": "tg_auth",
+                "telegram_id": tg_id,
+                "created_by": "admin_bot"
+            }).execute()
+
+        await query.edit_message_text(
+            query.message.text + f"\n\n✅ Создана компания «{new_company_name}» и доступ выдан"
+        )
+        try:
+            await ctx.bot.send_message(
+                tg_id,
+                f"✅ Доступ подтверждён!\n\n"
+                f"🏢 Компания: *{new_company_name}*\n\n"
+                f"Напиши /start чтобы начать работу.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Cannot notify HR {tg_id}: {e}")
+
+    # ── НАЗНАЧИТЬ МЕНЕДЖЕРОМ ─────────────────────────────────────────────────
+    elif data.startswith("make_manager:"):
+        _, tg_id_str = data.split(":", 1)
+        tg_id = int(tg_id_str)
+
+        pending = db.from_("pending_hr").select("*").eq("telegram_id", tg_id).execute()
+        p = pending.data[0] if pending.data else {}
+        full_name = p.get("full_name", f"Manager {tg_id}")
+        username = p.get("username", "")
+        login = (username or f"mgr_{tg_id}").lower()[:20]
+
+        # Проверить не существует ли уже
+        existing = db.from_("admin_users").select("id").eq("telegram_id", tg_id).execute()
+        if not existing.data:
+            db.from_("admin_users").insert({
+                "full_name": full_name,
+                "login": login,
+                "password_hash": "tg_auth",
+                "telegram_id": tg_id,
+                "role": "manager"
+            }).execute()
+
+        db.from_("pending_hr").update({"status": "approved"}).eq("telegram_id", tg_id).execute()
+
+        await query.edit_message_text(
+            query.message.text + f"\n\n🛠 Назначен менеджером: {full_name}"
+        )
+        try:
+            await ctx.bot.send_message(
+                tg_id,
+                f"✅ Тебе выдана роль *Менеджер КЛЧ*!\n\n"
+                f"Напиши /start для входа в систему.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Cannot notify manager {tg_id}: {e}")
+
     # ── ОТКЛОНИТЬ HR ────────────────────────────────────────────────────────
     elif data.startswith("reject_hr:"):
         _, tg_id_str = data.split(":", 1)
@@ -806,7 +903,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^👥 Состав команды$"), show_roster))
     app.add_handler(MessageHandler(filters.Regex("^📤 Отправить заявку$"), submit_registration))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статус заявки$"), check_status))
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(approve_hr|reject_hr|approve_reg|reject_reg):"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(approve_hr|reject_hr|approve_reg|reject_reg|newco_hr|make_manager):"))
     app.add_handler(CallbackQueryHandler(manager_tour_callback, pattern="^mgr_tour:"))
     app.add_handler(MessageHandler(filters.Regex("^🏆 Все турниры$"), manager_all_tournaments))
     app.add_handler(MessageHandler(filters.Regex("^📋 Все заявки$"), manager_all_registrations))
