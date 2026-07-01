@@ -36,6 +36,16 @@ async def get_hr(telegram_id: int):
     except Exception:
         return None
 
+async def get_manager(telegram_id: int):
+    """Вернуть admin_user если это менеджер или админ."""
+    try:
+        r = db.from_("admin_users").select("*")             .eq("telegram_id", telegram_id).execute()
+        if r.data and r.data[0]["role"] in ("admin", "manager"):
+            return r.data[0]
+        return None
+    except Exception:
+        return None
+
 async def get_registration(company_id: str, tournament_id: str):
     try:
         r = db.from_("team_registrations").select("*") \
@@ -59,11 +69,17 @@ async def open_tournaments():
     r = db.from_("tournaments").select("*").eq("status", "open").execute()
     return r.data or []
 
-async def send_admin(app, text):
+async def send_admin(app, text, reply_markup=None):
     try:
-        await app.bot.send_message(ADMIN_CHAT_ID, text)
+        await app.bot.send_message(ADMIN_CHAT_ID, text, reply_markup=reply_markup)
     except Exception as e:
         logger.warning(f"Admin notify failed: {e}")
+
+def manager_menu():
+    return ReplyKeyboardMarkup([
+        ["🏆 Все турниры", "📋 Все заявки"],
+        ["🔍 Найти команду", "👥 Игроки компании"],
+    ], resize_keyboard=True)
 
 def main_menu():
     return ReplyKeyboardMarkup([
@@ -76,11 +92,26 @@ def main_menu():
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
+    # 1. Проверяем менеджеров/админов
+    manager = await get_manager(tg_id)
+    if manager:
+        ctx.user_data["role"] = manager["role"]
+        ctx.user_data["manager_name"] = manager.get("full_name", "Менеджер")
+        role_label = "👑 Администратор" if manager["role"] == "admin" else "🛠 Менеджер"
+        await update.message.reply_text(
+            f"👋 Привет, *{manager.get('full_name', '')}*! {role_label}\n\nВыбери действие:",
+            parse_mode="Markdown",
+            reply_markup=manager_menu()
+        )
+        return ConversationHandler.END
+
+    # 2. Проверяем представителей команд
     hr = await get_hr(tg_id)
 
     if hr:
         ctx.user_data["company_id"] = hr["companies"]["id"]
         ctx.user_data["company_name"] = hr["companies"]["name"]
+        ctx.user_data["role"] = "representative"
         await update.message.reply_text(
             f"👋 Привет! Ты представитель *{hr['companies']['name']}*.\n\nВыбери действие:",
             parse_mode="Markdown",
@@ -135,13 +166,27 @@ async def receive_company(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+    # Получить список компаний для кнопок
+    companies_r = db.from_("companies").select("id,name").order("name").execute()
+    companies_list = companies_r.data or []
+    
+    kb = []
+    for c in companies_list[:10]:  # макс 10 кнопок
+        cname = c["name"][:20]
+        kb.append([InlineKeyboardButton(
+            f"✅ {cname}",
+            callback_data=f"approve_hr:{tg_id}:{c['id']}"
+        )])
+    kb.append([InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_hr:{tg_id}")])
+
     await send_admin(
         ctx.application,
         f"🆕 Новая заявка на доступ HR!\n"
-        f"👤 {user.full_name} (@{user.username})\n"
-        f"🏢 Компания: {company_name}\n"
+        f"👤 {user.full_name} (@{user.username or '—'})\n"
+        f"🏢 Написал: {company_name}\n"
         f"🆔 Telegram ID: {tg_id}\n\n"
-        f"Открой CoReg → Заявки на доступ → подтверди."
+        f"Выбери компанию для подтверждения:",
+        reply_markup=InlineKeyboardMarkup(kb)
     )
     return ConversationHandler.END
 
@@ -461,12 +506,17 @@ async def submit_registration(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu()
     )
 
+    kb = [[
+        InlineKeyboardButton("✅ Принять", callback_data=f"approve_reg:{reg['id']}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_reg:{reg['id']}")
+    ]]
     await send_admin(
         ctx.application,
         f"📋 Новая заявка на проверку!\n"
         f"🏢 {hr['companies']['name']}\n"
         f"🏆 {reg['tournaments']['name']}\n"
-        f"👥 Игроков: {count}"
+        f"👥 Игроков: {count}",
+        reply_markup=InlineKeyboardMarkup(kb)
     )
 
 # ─── СТАТУС ЗАЯВКИ ───────────────────────────────────────────────────────────
@@ -511,6 +561,215 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
+# ─── МЕНЕДЖЕР: ВСЕ ТУРНИРЫ ──────────────────────────────────────────────────
+
+async def manager_all_tournaments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    if not await get_manager(tg_id):
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+
+    tours = db.from_("tournaments").select("*").order("created_at", desc=True).execute()
+    if not tours.data:
+        await update.message.reply_text("Турниров нет.", reply_markup=manager_menu())
+        return
+
+    sport_icon = {"chess":"♟️","esports_cs2":"🎮","bowling":"🎳","football":"⚽","table_tennis":"🏓"}
+    status_label = {"open":"🟢 Открыт","draft":"⚪️ Черновик","closed":"🔴 Закрыт"}
+    text = "🏆 *Все турниры:*\n\n"
+    kb = []
+    for t in tours.data:
+        icon = sport_icon.get(t["sport_type"], "🏆")
+        st = status_label.get(t["status"], t["status"])
+        text += f"{icon} {t['name']}\n{st}\n\n"
+        kb.append([InlineKeyboardButton(
+            f"{icon} {t['name'][:30]}",
+            callback_data=f"mgr_tour:{t['id']}"
+        )])
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=manager_menu())
+    await update.message.reply_text("Выбери турнир:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def manager_all_registrations(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    if not await get_manager(tg_id):
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+
+    regs = db.from_("team_registrations")         .select("*,companies(name),tournaments(name)")         .order("created_at", desc=True).execute()
+
+    if not regs.data:
+        await update.message.reply_text("Заявок нет.", reply_markup=manager_menu())
+        return
+
+    status_icon = {"draft":"📝","submitted":"⏳","approved":"✅","rejected":"❌"}
+    text = "📋 *Все заявки:*\n\n"
+    for r in regs.data[:20]:
+        si = status_icon.get(r["status"], "❓")
+        text += f"{si} {r['companies']['name']} → {r['tournaments']['name']}\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=manager_menu())
+
+async def manager_tour_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tournament_id = query.data.replace("mgr_tour:", "")
+
+    regs = db.from_("team_registrations")         .select("*,companies(name),tournament_roster(id)")         .eq("tournament_id", tournament_id)         .order("created_at", desc=True).execute()
+
+    tour = db.from_("tournaments").select("name").eq("id", tournament_id).execute()
+    tour_name = tour.data[0]["name"] if tour.data else "—"
+
+    if not regs.data:
+        await query.message.reply_text(f"По турниру *{tour_name}* заявок нет.", parse_mode="Markdown")
+        return
+
+    status_icon = {"draft":"📝","submitted":"⏳","approved":"✅","rejected":"❌"}
+    text = f"📋 *{tour_name}*\n\n"
+    kb = []
+    for r in regs.data:
+        si = status_icon.get(r["status"], "❓")
+        count = len(r.get("tournament_roster") or [])
+        text += f"{si} {r['companies']['name']} — {count} игр.\n"
+        if r["status"] == "submitted":
+            kb.append([
+                InlineKeyboardButton(f"✅ Принять {r['companies']['name'][:15]}", callback_data=f"approve_reg:{r['id']}"),
+                InlineKeyboardButton("❌", callback_data=f"reject_reg:{r['id']}")
+            ])
+
+    await query.message.reply_text(text, parse_mode="Markdown")
+    if kb:
+        await query.message.reply_text("Заявки на рассмотрении:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок админа в групповом чате."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # ── ПОДТВЕРДИТЬ HR ──────────────────────────────────────────────────────
+    if data.startswith("approve_hr:"):
+        _, tg_id_str, company_id = data.split(":", 2)
+        tg_id = int(tg_id_str)
+
+        # Обновить pending_hr
+        db.from_("pending_hr").update({
+            "status": "approved",
+            "company_id": company_id
+        }).eq("telegram_id", tg_id).execute()
+
+        # Получить компанию
+        comp = db.from_("companies").select("name").eq("id", company_id).execute()
+        comp_name = comp.data[0]["name"] if comp.data else "—"
+
+        # Найти или создать company_users запись с telegram_id
+        existing = db.from_("company_users").select("id").eq("telegram_id", tg_id).execute()
+        if not existing.data:
+            # Создать новый логин на основе Telegram ID
+            pending = db.from_("pending_hr").select("username,full_name").eq("telegram_id", tg_id).execute()
+            p = pending.data[0] if pending.data else {}
+            login = (p.get("username") or f"hr_{tg_id}").lower().replace(" ", "_")[:20]
+            db.from_("company_users").insert({
+                "company_id": company_id,
+                "login": login,
+                "password_hash": "tg_auth",
+                "telegram_id": tg_id,
+                "created_by": "admin_bot"
+            }).execute()
+
+        await query.edit_message_text(
+            query.message.text + f"\n\n✅ Подтверждено → {comp_name}"
+        )
+
+        # Уведомить HR
+        try:
+            await ctx.bot.send_message(
+                tg_id,
+                f"✅ Твой доступ подтверждён!\n\n"
+                f"🏢 Компания: *{comp_name}*\n\n"
+                f"Напиши /start чтобы начать работу с заявкой.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Cannot notify HR {tg_id}: {e}")
+
+    # ── ОТКЛОНИТЬ HR ────────────────────────────────────────────────────────
+    elif data.startswith("reject_hr:"):
+        _, tg_id_str = data.split(":", 1)
+        tg_id = int(tg_id_str)
+
+        db.from_("pending_hr").update({"status": "rejected"}).eq("telegram_id", tg_id).execute()
+
+        await query.edit_message_text(query.message.text + "\n\n❌ Отклонено")
+
+        try:
+            await ctx.bot.send_message(
+                tg_id,
+                "❌ К сожалению, твоя заявка на доступ была отклонена.\n"
+                "Обратись к организатору КЛЧ за дополнительной информацией."
+            )
+        except Exception as e:
+            logger.warning(f"Cannot notify HR {tg_id}: {e}")
+
+    # ── ПРИНЯТЬ ЗАЯВКУ КОМАНДЫ ───────────────────────────────────────────────
+    elif data.startswith("approve_reg:"):
+        _, reg_id = data.split(":", 1)
+        db.from_("team_registrations").update({
+            "status": "approved",
+            "admin_comment": ""
+        }).eq("id", reg_id).execute()
+
+        # Найти HR компании
+        reg = db.from_("team_registrations").select("*,companies(name),tournaments(name)") \
+            .eq("id", reg_id).execute()
+        if reg.data:
+            r = reg.data[0]
+            comp_id = r["company_id"]
+            hr_user = db.from_("company_users").select("telegram_id").eq("company_id", comp_id).execute()
+            if hr_user.data and hr_user.data[0].get("telegram_id"):
+                try:
+                    await ctx.bot.send_message(
+                        hr_user.data[0]["telegram_id"],
+                        f"✅ Ваша заявка *принята*!\n\n"
+                        f"🏢 {r['companies']['name']}\n"
+                        f"🏆 {r['tournaments']['name']}",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.warning(f"Cannot notify HR: {e}")
+
+        await query.edit_message_text(query.message.text + "\n\n✅ Заявка принята")
+
+    # ── ОТКЛОНИТЬ ЗАЯВКУ КОМАНДЫ ─────────────────────────────────────────────
+    elif data.startswith("reject_reg:"):
+        _, reg_id = data.split(":", 1)
+        db.from_("team_registrations").update({
+            "status": "rejected",
+            "admin_comment": "Отклонено администратором"
+        }).eq("id", reg_id).execute()
+
+        reg = db.from_("team_registrations").select("*,companies(name),tournaments(name)") \
+            .eq("id", reg_id).execute()
+        if reg.data:
+            r = reg.data[0]
+            comp_id = r["company_id"]
+            hr_user = db.from_("company_users").select("telegram_id").eq("company_id", comp_id).execute()
+            if hr_user.data and hr_user.data[0].get("telegram_id"):
+                try:
+                    await ctx.bot.send_message(
+                        hr_user.data[0]["telegram_id"],
+                        f"❌ Ваша заявка *отклонена*.\n\n"
+                        f"🏢 {r['companies']['name']}\n"
+                        f"🏆 {r['tournaments']['name']}\n\n"
+                        f"Свяжитесь с организатором КЛЧ.",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.warning(f"Cannot notify HR: {e}")
+
+        await query.edit_message_text(query.message.text + "\n\n❌ Заявка отклонена")
+
+
 def main():
     app = Application.builder().token(TG_TOKEN).build()
 
@@ -547,6 +806,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^👥 Состав команды$"), show_roster))
     app.add_handler(MessageHandler(filters.Regex("^📤 Отправить заявку$"), submit_registration))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статус заявки$"), check_status))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(approve_hr|reject_hr|approve_reg|reject_reg):"))
+    app.add_handler(CallbackQueryHandler(manager_tour_callback, pattern="^mgr_tour:"))
+    app.add_handler(MessageHandler(filters.Regex("^🏆 Все турниры$"), manager_all_tournaments))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Все заявки$"), manager_all_registrations))
 
     logger.info("CoReg bot started")
     app.run_polling(drop_pending_updates=True)
