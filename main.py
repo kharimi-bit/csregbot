@@ -20,6 +20,12 @@ TG_TOKEN = os.environ.get("TG_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "-5218962193"))
 
 db = create_client(SB_URL, SB_KEY)
+WEB_URL = "https://cosportsreg.vercel.app"
+PLATFORM_TIP = (
+    "\n\n💡 Работай где удобно:\n"
+    f"• Telegram-бот — прямо здесь\n"
+    f"• Веб-панель — {WEB_URL}"
+)
 
 # States
 (AWAIT_COMPANY, AWAIT_PLAYER_NAME, AWAIT_PLAYER_PHONE,
@@ -113,7 +119,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["company_name"] = hr["companies"]["name"]
         ctx.user_data["role"] = "representative"
         await update.message.reply_text(
-            f"👋 Привет! Ты представитель *{hr['companies']['name']}*.\n\nВыбери действие:",
+            f"👋 Привет! Ты представитель *{hr['companies']['name']}*.\n\n"
+            f"Выбери действие или работай в веб-панели:\n{WEB_URL}",
             parse_mode="Markdown",
             reply_markup=main_menu()
         )
@@ -473,7 +480,8 @@ async def save_new_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     }).execute()
 
     await update.message.reply_text(
-        f"✅ *{p['name']}* добавлен в состав и архив компании!",
+        f"✅ *{p['name']}* добавлен в состав и архив компании!"
+        f"{PLATFORM_TIP}",
         parse_mode="Markdown",
         reply_markup=main_menu()
     )
@@ -513,7 +521,8 @@ async def submit_registration(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"📤 Заявка *{hr['companies']['name']}* на *{reg['tournaments']['name']}* отправлена на проверку!\n\n"
-        f"Ты получишь уведомление когда администратор её рассмотрит.",
+        f"Ты получишь уведомление когда администратор её рассмотрит."
+        f"{PLATFORM_TIP}",
         parse_mode="Markdown",
         reply_markup=main_menu()
     )
@@ -1175,6 +1184,7 @@ async def bulk_add_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result += f"\n\n⏭ Уже были в заявке: {len(skipped)}"
 
     ctx.user_data.pop("pending_players", None)
+    result += f"\n{PLATFORM_TIP}"
     await query.edit_message_text(result, reply_markup=None)
 
 async def reset_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
